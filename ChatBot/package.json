@@ -1,11 +1,21 @@
 {
+  "name": "backendeasy",
+  "version": "1.0.0",
+  "description": "Chatbot e API de dados unificados",
+  "main": "main_server.js",
+  "scripts": {
+    "start": "node main_server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "dependencies": {
     "moment-timezone": "^0.5.45",
     "node-cron": "^4.2.1",
-    "openai": "^4.78.1",
     "puppeteer": "^24.26.0",
     "puppeteer-core": "^24.26.0",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp-web.js": "^1.23.0",
+    "axios": "^1.7.2",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.1"
   }
 }
