@@ -4,221 +4,176 @@ const axios = require('axios');
 
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
-        ]
-    }
+    puppeteer: { headless: true }
 });
 
-const OMIE_APP_KEY = '6887695778964'; 
-const OMIE_APP_SECRET = '9aa89482d2cc134634cbbd4f45c2cf3a';
-
-client.on('qr', qr => {
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('Tudo certo! WhatsApp conectado.');
-});
-
+client.on('qr', qr => qrcode.generate(qr, { small: true }));
+client.on('ready', () => console.log('WhatsApp conectado!'));
 client.initialize();
 
-const delay = ms => new Promise(res => setTimeout(res, ms));
 const userState = {};
 
-async function consultarDadosFinanceiros() {
+// ------------------ API OMIE ------------------
+
+async function consultarAPI(filtros) {
     try {
-        const body = {
-            call: "ListarMovimentos",
-            app_key: OMIE_APP_KEY,
-            app_secret: OMIE_APP_SECRET,
-            param: [{
-                nPagina: 1,
-                nRegPorPagina: 500 
-            }]
-        };
-
-        const response = await axios.post('https://app.omie.com.br/api/v1/financas/mf/', body);
-        
-        if (!response.data || !response.data.movimentos) {
-            return null;
-        }
-
-        const movimentos = response.data.movimentos;
-        
-        let resumo = {
-            totalRecebido: 0,
-            totalPago: 0,
-            receitasOperacionais: 0, // 1.0
-            custosVariaveis: 0,      // 2.1
-            despesasFixas: 0,        // 3.0 + 3.1 + 3.2
-            resultadoOperacional: 0
-        };
-
-        const hoje = new Date();
-        const dataInicio = new Date();
-        
-        dataInicio.setMonth(hoje.getMonth() - 1);
-        
-        hoje.setHours(23, 59, 59, 999);
-        dataInicio.setHours(0, 0, 0, 0);
-
-        movimentos.forEach(mov => {
-            const valor = mov.nValorTitulo;
-            const categoria = (mov.detalhes.cCodCateg || "").trim(); 
-            const status = mov.detalhes.cStatus;
-            
-            const dataMovimentoString = mov.detalhes.dDtPagamento || mov.detalhes.dDtPrevisao;
-            
-            if (!dataMovimentoString) return; 
-
-            const partesData = dataMovimentoString.split('/');
-            const dataMovimento = new Date(partesData[2], partesData[1] - 1, partesData[0]); 
-
-            const realizado = status === 'RECEBIDO' || status === 'PAGO';
-            const naJanela = dataMovimento >= dataInicio && dataMovimento <= hoje;
-
-            if (realizado && naJanela) {
-                
-                if (mov.detalhes.cNatureza === 'R') {
-                    resumo.totalRecebido += valor;
-
-                    if (categoria.startsWith('1.0')) {
-                        resumo.receitasOperacionais += valor;
-                    }
-                }
-                
-                if (mov.detalhes.cNatureza === 'P') {
-                    resumo.totalPago += valor;
-
-                    if (categoria.startsWith('2.1')) {
-                        resumo.custosVariaveis += valor;
-                    }
-
-                    if (categoria.startsWith('3.0') || categoria.startsWith('3.1') || categoria.startsWith('3.2')) {
-                        resumo.despesasFixas += valor;
-                    }
-                }
-            }
-        });
-
-        resumo.resultadoOperacional = resumo.receitasOperacionais - resumo.custosVariaveis - resumo.despesasFixas;
-
-        return resumo;
-
-    } catch (error) {
-        console.error("Erro na API Omie:", error?.response?.data || error.message);
+        const response = await axios.post(
+            'http://127.0.0.1:5001/omie/filtrar',
+            filtros,
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+        return response.data;
+    } catch (err) {
+        console.log(err);
         return null;
     }
 }
 
-client.on('message', async msg => {
-    const chat = await msg.getChat();
-    const user = msg.from; 
+function calcularResumo(movs, categoriaFiltro = null) {
+    const resumo = {
+        totalRecebido: 0,
+        totalPago: 0
+    };
 
-    if (msg.body.match(/(menu|Menu|oi|Oi|Olá|olá|ajuda|teste)/i) && msg.from.endsWith('@c.us')) {
-        delete userState[user]; 
-        await delay(1000);
-        const contact = await msg.getContact();
-        const name = contact.pushname || 'amigo';
-        await client.sendMessage(user, `Olá, ${name}! 👋 Sou a IZI, assistente virtual da EASY. Como posso te ajudar? Envie o número de acordo com o que você procura no momento: \n\n1️⃣ - Relatório Mensal\n2️⃣ - Detalhamento Financeiro\n3️⃣ - Horário\n4️⃣ - Suporte`);
-        return; 
+    movs.forEach(m => {
+        const d = m.detalhes;
+        const valor = Number(d.nValorTitulo || 0);
+        const cat = d.cCodCateg;
+        const nat = d.cNatureza;
+
+        if (categoriaFiltro && !cat.startsWith(categoriaFiltro)) return;
+
+        if (nat === "R") resumo.totalRecebido += valor;
+        if (nat === "P") resumo.totalPago += valor;
+    });
+
+    return resumo;
+}
+
+function formatarResumo(r) {
+    return `📊 *Resumo Financeiro*\n\n` +
+        `💰 Total Recebido: R$ ${r.totalRecebido.toFixed(2)}\n` +
+        `💸 Total Pago: R$ ${r.totalPago.toFixed(2)}`;
+}
+
+// ------------------ BOT LÓGICA ------------------
+
+client.on('message', async msg => {
+    const user = msg.from;
+    const body = msg.body.trim();
+
+    // Inicialização
+    if (!userState[user]) {
+        if (/menu|oi|olá|ajuda|teste/i.test(body)) {
+            userState[user] = { stage: 'menu' };
+            return msg.reply(
+                "Olá! 👋\nEscolha:\n1️⃣ - Relatório Mensal\n2️⃣ - Detalhamento por Categoria"
+            );
+        }
+        return;
     }
 
-    const currentState = userState[user];
+    const S = userState[user];
 
-    if (!currentState) {
-        if (msg.body === '1') {
-            userState[user] = 'menu_financeiro';
-            await client.sendMessage(user, 'Calculando relatório mensal... ⏳');
-            
-            const dados = await consultarDadosFinanceiros();
+    // --------------- VOLTAR ---------------
+    if (body === "0") {
+        if (S.stage === "periodo" || S.stage === "categoria") {
+            S.stage = "menu";
+            return msg.reply("Voltando...\n\n1️⃣ Relatório Mensal\n2️⃣ Detalhamento por Categoria");
+        }
 
-            if (dados) {
-                userState[user + '_dados'] = dados;
-
-                const texto = `📊 *Relatório Financeiro Mensal (Últimos 30 dias)*\n\n` +
-                              `💰 *Total Recebido:* R$ ${dados.totalRecebido.toFixed(2)}\n` +
-                              `💸 *Total Pago:* R$ ${dados.totalPago.toFixed(2)}\n\n` +
-                              `------------------------------\n` +
-                              `📈 *Detalhamento Operacional:*\n` +
-                              `🔹 Receitas Operacionais: R$ ${dados.receitasOperacionais.toFixed(2)}\n` +
-                              `🔸 Custos Variáveis: R$ ${dados.custosVariaveis.toFixed(2)}\n` +
-                              `🏢 Despesas Fixas: R$ ${dados.despesasFixas.toFixed(2)}\n` +
-                              `------------------------------\n` +
-                              `🏁 *Resultado Operacional: R$ ${dados.resultadoOperacional.toFixed(2)}*\n\n` +
-                              `*3* - Voltar`;
-                
-                await client.sendMessage(user, texto);
+        if (S.stage === "datas") {
+            if (S.categoria) {
+                S.stage = "categoria";
+                return msg.reply("Voltando...\nEscolha a categoria:\n1️⃣ Receitas\n2️⃣ Custos\n3️⃣ Despesas");
             } else {
-                await client.sendMessage(user, 'Erro ao buscar dados. Tente mais tarde.');
-                delete userState[user];
+                S.stage = "periodo";
+                return msg.reply(
+                    "Voltando...\nEscolha o período:\n1️⃣ 30 dias\n2️⃣ 60 dias\n3️⃣ 90 dias\n4️⃣ Período personalizado"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------
+
+    switch (S.stage) {
+
+        // MENU PRINCIPAL --------------------------------
+        case "menu":
+            if (body === "1") {
+                S.stage = "periodo";
+                return msg.reply(
+                    "Escolha:\n1️⃣ 30 dias\n2️⃣ 60 dias\n3️⃣ 90 dias\n4️⃣ Período personalizado\n\n0️⃣ Voltar"
+                );
             }
 
-        } else if (msg.body === '2') {
-             userState[user] = 'menu_detalhamento';
-             
-             if (!userState[user + '_dados']) {
-                 await client.sendMessage(user, 'Buscando dados para detalhamento... ⏳');
-                 const dados = await consultarDadosFinanceiros();
-                 if (dados) {
-                     userState[user + '_dados'] = dados;
-                 } else {
-                     await client.sendMessage(user, 'Erro ao buscar dados. Tente mais tarde.');
-                     delete userState[user];
-                     return;
-                 }
-             }
-             
-             await client.sendMessage(user, `🔎 *Detalhamento Financeiro*\n\n*1* - Custos Variáveis\n*2* - Receitas Operacionais\n*3* - Despesas Fixas\n*4* - Voltar ao menu principal`);
+            if (body === "2") {
+                S.stage = "categoria";
+                return msg.reply(
+                    "Escolha a categoria:\n1️⃣ Receitas\n2️⃣ Custos\n3️⃣ Despesas\n\n0️⃣ Voltar"
+                );
+            }
 
-        } else if (msg.body === '3') {
-             await client.sendMessage(user, 'Atendimento das 08:00 às 22:00.');
-        } else if (msg.body === '4') {
-             await client.sendMessage(user, 'Fale com o suporte: https://wa.me/5579981310201');
-        }
+            return msg.reply("Opção inválida. Digite 1 ou 2.");
 
-    } else if (currentState === 'menu_financeiro') {
-        if (msg.body === '3') {
-            delete userState[user];
-            const contact = await msg.getContact();
-            const name = contact.pushname || 'amigo';
-            await client.sendMessage(user, `Olá, ${name}! Como posso te ajudar agora? Envie o número de acordo com o que você procura no momento: \n\n1️⃣ - Relatório Mensal\n2️⃣ - Detalhamento Financeiro\n3️⃣ - Horário\n4️⃣ - Suporte`);
-        } else {
-            await client.sendMessage(user, 'Opção inválida. Digite *3* para voltar.');
-        }
+        // PERÍODO ----------------------------------------
+        case "periodo":
+            let inicio, fim = "2026-12-31";
 
-    } else if (currentState === 'menu_detalhamento') {
-        const dados = userState[user + '_dados'];
+            if (body === "1") inicio = "2025-11-01";
+            else if (body === "2") inicio = "2025-10-01";
+            else if (body === "3") inicio = "2025-09-01";
+            else if (body === "4") {
+                S.stage = "datas";
+                return msg.reply("Digite no formato:\n\nYYYY-MM-DD até YYYY-MM-DD\n\n0️⃣ Voltar");
+            } else {
+                return msg.reply("Opção inválida.");
+            }
 
-        if (msg.body === '1') {
-            await client.sendMessage(user, `📉 *Custos Variáveis*\nValor Total: R$ ${dados.custosVariaveis.toFixed(2)}`);
-            await client.sendMessage(user, 'Escolha outra opção de detalhamento ou digite *4* para voltar.');
+            const dados = await consultarAPI({ data_inicio: inicio, data_fim: fim });
 
-        } else if (msg.body === '2') {
-            await client.sendMessage(user, `📈 *Receitas Operacionais*\nValor Total: R$ ${dados.receitasOperacionais.toFixed(2)}`);
-            await client.sendMessage(user, 'Escolha outra opção de detalhamento ou digite *4* para voltar.');
+            if (!dados || !dados.movimentos.length)
+                return msg.reply("Nenhum movimento encontrado.");
 
-        } else if (msg.body === '3') {
-            await client.sendMessage(user, `🏢 *Despesas Fixas*\nValor Total: R$ ${dados.despesasFixas.toFixed(2)}`);
-            await client.sendMessage(user, 'Escolha outra opção de detalhamento ou digite *4* para voltar.');
+            msg.reply(formatarResumo(calcularResumo(dados.movimentos)));
 
-        } else if (msg.body === '4') {
-            delete userState[user];
-            const contact = await msg.getContact();
-            const name = contact.pushname || 'amigo';
-            await client.sendMessage(user, `Olá, ${name}! Como posso te ajudar agora? Envie o número de acordo com o que você procura no momento: \n\n1️⃣ - Relatório Mensal\n2️⃣ - Detalhamento Financeiro\n3️⃣ - Horário\n4️⃣ - Suporte`);
-        } else {
-             await client.sendMessage(user, 'Opção inválida. Escolha de 1 a 3 para detalhes ou 4 para voltar.');
-        }
+            S.stage = "menu";
+            break;
+
+        // CATEGORIA --------------------------------------
+        case "categoria":
+            const cats = { "1": "1.", "2": "2.", "3": "3" };
+
+            if (!cats[body])
+                return msg.reply("Escolha:\n1️⃣ Receitas\n2️⃣ Custos\n3️⃣ Despesas\n\n0️⃣ Voltar");
+
+            S.categoria = cats[body];
+            S.stage = "datas";
+            return msg.reply("Digite o período:\n\nYYYY-MM-DD até YYYY-MM-DD\n\n0️⃣ Voltar");
+
+        // DATAS ------------------------------------------
+        case "datas":
+            const reg = /(\d{4}-\d{2}-\d{2})\s+até\s+(\d{4}-\d{2}-\d{2})/;
+            const match = body.match(reg);
+
+            if (!match)
+                return msg.reply("Formato inválido.\nUse: YYYY-MM-DD até YYYY-MM-DD\n\n0️⃣ Voltar");
+
+            const [_, di, df] = match;
+
+            const filtrados = await consultarAPI({
+                categoria: S.categoria || null,
+                data_inicio: di,
+                data_fim: df
+            });
+
+            if (!filtrados || !filtrados.movimentos.length)
+                return msg.reply("Nenhum movimento encontrado.");
+
+            msg.reply(formatarResumo(calcularResumo(filtrados.movimentos, S.categoria)));
+
+            S.stage = "menu";
+            break;
     }
 });
